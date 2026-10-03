@@ -15,6 +15,20 @@
 
 ## ✅ Work Completed
 
+### [2026-10-03] — Codebase Refactoring & Pipeline Execution
+
+- **Bug Fixes & Refactoring**:
+  - Fixed GAN generator training loop indentation bug in `02_train_generator.py` that caused it to only train one batch.
+  - Resolved NumPy 2.0 `__array_wrap__` DeprecationWarnings and array-to-tensor `.to(device)` casting crashes.
+  - Removed MLflow dependencies to allow for fully local, clean runs. Updated `.gitignore` and `README.md`.
+- **Strict Methodology Enforcement**:
+  - Identified the "Isolated Node Shortcut" failure (where GNN memorizes degree=0 nodes as fraud) and implemented the K-NN Edge Predictor fallback to synthetically wire fake nodes into the real graph.
+  - Enforced strict Phase 1.4 temporal splits (Train 1-29, Val 30-34, Test 35-49) instead of random splitting.
+  - Enforced strict Phase 3.2 temporal constraints during edge injection (candidate nodes must be <= synthetic time to prevent future data leakage).
+- **GNN Architecture Improvements**:
+  - Reduced GraphSAGE classifier from 3 layers to 2 layers to prevent severe oversmoothing.
+  - Changed base PyTorch `edge_index` to be undirected/bidirectional so GraphSAGE can aggregate from both sending and receiving nodes.
+
 ### [2026-08-30] — Full codebase implementation
 
 - **Repository structure** created at `c:\Users\HP\Desktop\project1\`
