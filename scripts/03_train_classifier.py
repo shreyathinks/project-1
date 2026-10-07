@@ -3,7 +3,6 @@ import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
@@ -11,14 +10,11 @@ import json
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from graphguard.models.generator import TemporalGenerator
+from graphguard.models.generator import TemporalGenerator, aggregate_neighbourhood
+from graphguard.models.edge_predictor import EdgePredictor
 from graphguard.models.baseline_graphsage import GraphSAGEClassifier
 
 def optimize_threshold(y_true, y_prob):
-    """
-    Fix for the Thresholding Trap:
-    Instead of using 0.5 (or argmax on logits), we find the threshold that maximizes F1.
-    """
     thresholds = np.linspace(0.01, 0.99, 100)
     best_f1 = 0.0
     best_thresh = 0.5
@@ -31,148 +27,114 @@ def optimize_threshold(y_true, y_prob):
     return best_thresh, best_f1
 
 def train_classifier():
-    print("Loading preprocessed data...")
-    data_dir = "e:/GraphGuard/project-1/dataset/processed"
-    df_nodes = pd.read_csv(os.path.join(data_dir, 'processed_nodes.csv'))
-    df_edges = pd.read_csv(os.path.join(data_dir, 'processed_edges.csv'))
+    print("Loading preprocessed .pt data...")
+    # Fix Issue 1: Correct paths to local processed data
+    data_dir = os.path.join(os.path.dirname(__file__), '..', 'graphguard', 'data', 'processed')
     
-    # Sort by time_step
-    df_nodes = df_nodes.sort_values('time_step').reset_index(drop=True)
-    
-    # Build tx_to_idx mapping
-    tx_to_idx = {tx: i for i, tx in enumerate(df_nodes['txId'])}
-    
-    # Build edge_index
-    valid_edges = df_edges[df_edges['txId1'].isin(tx_to_idx) & df_edges['txId2'].isin(tx_to_idx)]
-    src = torch.tensor([tx_to_idx[tx] for tx in valid_edges['txId1']], dtype=torch.long)
-    dst = torch.tensor([tx_to_idx[tx] for tx in valid_edges['txId2']], dtype=torch.long)
-    edge_index = torch.stack([src, dst], dim=0)
-    
-    # Make edges undirected (bidirectional) so GNN can aggregate from both parents and children
-    edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
-    
-    # Base Graph
-    X = torch.tensor(df_nodes[[f'f{i}' for i in range(1, 166)]].values, dtype=torch.float32)
-    y = torch.tensor(df_nodes['class_label'].values, dtype=torch.float32)
-    timesteps = torch.tensor(df_nodes['time_step'].values, dtype=torch.long)
-    
-    # STRICT METHODOLOGY (Phase 1.4): Temporal Splits
-    # Train: 1-29, Val: 30-34, Test: 35-49
-    known_mask = (y != -1)
-    train_mask = known_mask & (timesteps <= 29)
-    val_mask = known_mask & (timesteps >= 30) & (timesteps <= 34)
-    test_mask = known_mask & (timesteps >= 35)
-    
-    real_train_idx = torch.nonzero(train_mask).squeeze()
-    val_idx = torch.nonzero(val_mask).squeeze()
-    test_idx = torch.nonzero(test_mask).squeeze()
+    X = torch.load(os.path.join(data_dir, 'node_features.pt'))
+    y = torch.load(os.path.join(data_dir, 'labels.pt'))
+    timesteps = torch.load(os.path.join(data_dir, 'timestep.pt'))
+    edge_index = torch.load(os.path.join(data_dir, 'edge_index.pt'))
+    train_mask = torch.load(os.path.join(data_dir, 'train_mask.pt'))
+    val_mask = torch.load(os.path.join(data_dir, 'val_mask.pt'))
+    test_mask = torch.load(os.path.join(data_dir, 'test_mask.pt'))
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     X = X.to(device)
-    y = y.to(device)
+    y = y.to(device).float()
     timesteps = timesteps.to(device)
     edge_index = edge_index.to(device)
     
-    real_train_idx = real_train_idx.to(device)
-    val_idx = val_idx.to(device)
-    test_idx = test_idx.to(device)
+    real_train_idx = torch.nonzero(train_mask).squeeze().to(device)
+    val_idx = torch.nonzero(val_mask).squeeze().to(device)
+    test_idx = torch.nonzero(test_mask).squeeze().to(device)
     
-    print("Loading Generator for Oversampling...")
-    generator = TemporalGenerator(feat_dim=165).to(device)
-    gen_path = "e:/GraphGuard/project-1/graphguard/models/trained/generator.pt"
+    print("Loading Generator and Edge Predictor for Oversampling...")
+    generator = TemporalGenerator(feat_dim=166).to(device)
+    edge_predictor = EdgePredictor(feat_dim=166).to(device)
+    
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    models_dir = os.path.join(project_root, "graphguard", "models", "trained")
+    gen_path = os.path.join(models_dir, "generator.pt")
+    ep_path = os.path.join(models_dir, "edge_predictor.pt")
     
     num_illicit = (y[real_train_idx] == 1).sum().item()
     num_licit = (y[real_train_idx] == 0).sum().item()
     num_to_generate = num_licit - num_illicit
     
-    # Synthetic nodes will be appended to X and y, and their indices added to real_train_idx
-    if os.path.exists(gen_path) and num_to_generate > 0:
+    if os.path.exists(gen_path) and os.path.exists(ep_path) and num_to_generate > 0:
         generator.load_state_dict(torch.load(gen_path, map_location=device))
         generator.eval()
+        edge_predictor.load_state_dict(torch.load(ep_path, map_location=device))
+        edge_predictor.eval()
         
         illicit_mask = y[real_train_idx] == 1
-        real_illicit_feats = X[real_train_idx][illicit_mask]
+        real_illicit_idx = real_train_idx[illicit_mask]
+        real_illicit_feats = X[real_illicit_idx]
         
         idx = torch.randint(0, len(real_illicit_feats), (num_to_generate,), device=device)
         seed_feats = real_illicit_feats[idx]
+        seed_timesteps = timesteps[real_illicit_idx][idx]
+        seed_center_idx = real_illicit_idx[idx]
         
-        # STRICT METHODOLOGY: Use actual timesteps of the seed nodes, not dummy ones!
-        seed_timesteps = timesteps[real_train_idx][illicit_mask][idx]
-        
-        dummy_neigh = torch.zeros_like(seed_feats)
+        print("Generating synthetic node features...")
+        neigh_feats = aggregate_neighbourhood(X, seed_center_idx, edge_index, k_hops=1)
         
         with torch.no_grad():
-            synthetic_feats = generator.sample(seed_feats, dummy_neigh, seed_timesteps, n_samples=1)
+            synthetic_feats = generator.sample(seed_feats, neigh_feats, seed_timesteps, n_samples=1)
             
         synthetic_labels = torch.ones(num_to_generate, dtype=torch.float32, device=device)
         
         X = torch.cat([X, synthetic_feats], dim=0)
         y = torch.cat([y, synthetic_labels], dim=0)
         
-        # New nodes have indices from len(X)-num_to_generate to len(X)-1
         synth_idx = torch.arange(len(X) - num_to_generate, len(X), device=device)
         extended_train_idx = torch.cat([real_train_idx, synth_idx], dim=0)
         print(f"Oversampled {num_to_generate} synthetic illicit nodes.")
         
-        # --- Edge Injection (KNN Fallback from Implementation Plan) ---
-        print("Injecting edges for synthetic nodes via K-NN...")
-        import torch.nn.functional as F
+        # --- Fix Issue 4 & 6: Use EdgePredictor instead of K-NN for broad topology ---
+        print("Injecting edges for synthetic nodes via trained EdgePredictor...")
         
-        real_illicit_norm = F.normalize(real_illicit_feats, p=2, dim=1)
-        synth_norm = F.normalize(synthetic_feats, p=2, dim=1)
+        cand_feats = X[:len(X)-num_to_generate]
+        cand_ts = timesteps[:len(timesteps)-num_to_generate]
+        cand_idx_tensor = torch.arange(len(cand_feats), device=device)
         
-        # Memory-efficient similarity and top-K computation
-        K = 3
         new_src = []
         new_dst = []
         
-        global_real_illicit_idx = real_train_idx[illicit_mask]
-        real_illicit_timesteps = timesteps[global_real_illicit_idx]
-        
-        # Process in batches to avoid OOM on similarity matrix
-        batch_size_knn = 1000
-        for i in range(0, num_to_generate, batch_size_knn):
-            end_idx = min(i + batch_size_knn, num_to_generate)
-            sim_batch = torch.matmul(synth_norm[i:end_idx], real_illicit_norm.t())
-            
-            # STRICT METHODOLOGY: Mask out future nodes (time_candidate > time_synthetic)
-            for local_i in range(end_idx - i):
-                synth_t = seed_timesteps[i + local_i]
-                # Candidates must be <= synth_t
-                valid_candidates_mask = (real_illicit_timesteps <= synth_t)
+        batch_size = 500
+        with torch.no_grad():
+            for i in range(0, num_to_generate, batch_size):
+                end = min(i + batch_size, num_to_generate)
+                batch_synth_feats = synthetic_feats[i:end]
+                batch_synth_ts = seed_timesteps[i:end]
                 
-                # If no valid candidates (rare), fallback to all illicit nodes
-                if not valid_candidates_mask.any():
-                    valid_candidates_mask = torch.ones_like(valid_candidates_mask, dtype=torch.bool)
+                temporal_mask = (cand_ts.unsqueeze(0) <= batch_synth_ts.unsqueeze(1))
                 
-                # Apply mask to similarity scores (-inf to invalid)
-                masked_sim = sim_batch[local_i].clone()
-                masked_sim[~valid_candidates_mask] = -float('inf')
+                topk_indices_list = edge_predictor.select_topk(
+                    batch_synth_feats, cand_feats, batch_synth_ts, cand_ts, temporal_mask
+                )
                 
-                # Ensure we don't ask for more neighbors than valid candidates
-                actual_k = min(K, valid_candidates_mask.sum().item())
-                if actual_k == 0:
-                    continue
-                    
-                _, topk_idx = torch.topk(masked_sim, k=actual_k)
-                
-                synth_node_id = synth_idx[i + local_i].item()
-                for k in range(actual_k):
-                    neighbor_local = topk_idx[k].item()
-                    neighbor_global = global_real_illicit_idx[neighbor_local].item()
-                    new_src.extend([synth_node_id, neighbor_global])
-                    new_dst.extend([neighbor_global, synth_node_id])
-                    
+                for local_i, neighbors in enumerate(topk_indices_list):
+                    synth_node_id = synth_idx[i + local_i].item()
+                    for neighbor_local in neighbors:
+                        neighbor_global = cand_idx_tensor[neighbor_local.item()].item()
+                        new_src.extend([synth_node_id, neighbor_global])
+                        new_dst.extend([neighbor_global, synth_node_id])
+                        
         new_edges = torch.tensor([new_src, new_dst], dtype=torch.long, device=device)
         edge_index = torch.cat([edge_index, new_edges], dim=1)
         print(f"Injected {new_edges.size(1)} synthetic edges into the graph.")
         
     else:
+        print("Generator/EdgePredictor not found or no balancing needed. Training on real data only.")
         extended_train_idx = real_train_idx
         
+    # Make edges undirected so GNN can aggregate from both parents and children
+    edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+    
     # Initialize GraphSAGE
-    # We change out_channels to 1 for BCEWithLogitsLoss
-    model = GraphSAGEClassifier(in_channels=165, hidden_channels=256, out_channels=1).to(device)
+    model = GraphSAGEClassifier(in_channels=166, hidden_channels=256, out_channels=1).to(device)
     opt = optim.Adam(model.parameters(), lr=5e-3, weight_decay=1e-5)
     criterion = nn.BCEWithLogitsLoss()
     
@@ -180,7 +142,7 @@ def train_classifier():
     
     # Setup Results Directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = f"e:/GraphGuard/project-1/results/classifier_gnn/run_{timestamp}"
+    run_dir = os.path.join(project_root, "results", "classifier_gnn", f"run_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
     
     train_loss_hist = []
@@ -188,14 +150,13 @@ def train_classifier():
     val_f1_hist = []
     
     print("Training Downstream GraphSAGE Classifier (Full Batch)...")
+    best_val_f1 = 0
+    best_thresh = 0.5
     for epoch in range(epochs):
         model.train()
         opt.zero_grad()
         
-        # Full batch forward pass
         logits = model(X, edge_index).squeeze()
-        
-        # Compute loss only on extended_train_idx
         loss = criterion(logits[extended_train_idx], y[extended_train_idx])
         loss.backward()
         opt.step()
@@ -208,14 +169,17 @@ def train_classifier():
             val_probs = torch.sigmoid(val_logits).cpu().numpy()
             y_val_np = y[val_idx].cpu().numpy()
             
-            best_thresh, val_f1 = optimize_threshold(y_val_np, val_probs)
+            thresh, val_f1 = optimize_threshold(y_val_np, val_probs)
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_thresh = thresh
             
         train_loss_hist.append(loss.item())
         val_loss_hist.append(val_loss)
         val_f1_hist.append(val_f1)
         
         if (epoch + 1) % 50 == 0:
-            print(f"Epoch {epoch+1}/{epochs} | Train Loss: {loss.item():.4f} | Val F1: {val_f1:.4f} @ T={best_thresh:.2f}")
+            print(f"Epoch {epoch+1}/{epochs} | Train Loss: {loss.item():.4f} | Val F1: {val_f1:.4f} @ T={thresh:.2f}")
 
     print("Evaluating on Test Set...")
     model.eval()
@@ -264,8 +228,8 @@ def train_classifier():
     with open(os.path.join(run_dir, 'metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=4)
     
-    os.makedirs("e:/GraphGuard/project-1/graphguard/models/trained", exist_ok=True)
-    torch.save(model.state_dict(), "e:/GraphGuard/project-1/graphguard/models/trained/graphsage.pt")
+    os.makedirs(models_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(models_dir, "graphsage.pt"))
     torch.save(model.state_dict(), os.path.join(run_dir, "graphsage.pt"))
     print("Classifier saved locally.")
 

@@ -3,80 +3,127 @@ import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
 import json
+import networkx as nx
+
+def get_k_hop_subgraph(node_idx, num_hops, edge_index):
+    device = edge_index.device
+    num_nodes = edge_index.max().item() + 1
+    
+    subset = node_idx.clone()
+    for _ in range(num_hops):
+        node_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        node_mask[subset] = True
+        
+        edge_mask = node_mask[edge_index[0]] | node_mask[edge_index[1]]
+        neighbors = torch.cat([edge_index[0, edge_mask], edge_index[1, edge_mask]])
+        subset = torch.unique(torch.cat([subset, neighbors]))
+        
+    node_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+    node_mask[subset] = True
+    edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
+    sub_edge_index = edge_index[:, edge_mask]
+    
+    # relabel nodes
+    n_idx = torch.zeros(num_nodes, dtype=torch.long, device=device)
+    n_idx[subset] = torch.arange(subset.size(0), device=device)
+    sub_edge_index = n_idx[sub_edge_index]
+    mapping = n_idx[node_idx]
+    
+    return subset, sub_edge_index, mapping, edge_mask
 
 # Add graphguard to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from graphguard.models.generator import TemporalGenerator, aggregate_neighbourhood
 from graphguard.models.discriminator import GraphGuardDiscriminator
+from graphguard.models.edge_predictor import EdgePredictor
+from graphguard.training.losses import temporal_violation_penalty, generator_loss, feature_matching_loss
 
-def compute_structural_stats(edge_index, center_nodes, num_nodes):
-    device = edge_index.device
-    src, dst = edge_index
+def compute_real_stats(subgraph_edge_index, center_nodes_rel, num_nodes, labels_sub=None):
+    device = subgraph_edge_index.device
+    edges = subgraph_edge_index.t().cpu().numpy()
+    G = nx.Graph()
+    G.add_nodes_from(range(num_nodes))
+    G.add_edges_from(edges)
     
-    # Degree of center nodes
-    degrees = torch.zeros(num_nodes, device=device)
-    degrees.index_add_(0, src, torch.ones_like(src, dtype=torch.float))
-    degrees.index_add_(0, dst, torch.ones_like(dst, dtype=torch.float))
+    centers = center_nodes_rel.cpu().numpy().tolist()
+    # Clustering coefficient for all center nodes
+    clustering = nx.clustering(G, nodes=centers)
     
-    center_degrees = degrees[center_nodes]
-    
-    stats = torch.zeros((len(center_nodes), 4), device=device)
-    stats[:, 0] = center_degrees / 100.0  # Normalized degree
-    
-    stats[:, 1] = torch.rand(len(center_nodes), device=device) * 0.5
-    stats[:, 2] = torch.rand(len(center_nodes), device=device) * 0.5
-    stats[:, 3] = torch.rand(len(center_nodes), device=device) * 0.5
-    
-    return stats
+    stats = []
+    for c in centers:
+        deg = G.degree(c) / 100.0  # Normalized degree
+        clust = clustering[c]
+        
+        # ego density
+        ego = nx.ego_graph(G, c, radius=1)
+        dens = nx.density(ego)
+        
+        # homophily in ego network
+        homo = 0.5
+        if labels_sub is not None:
+            ego_edges = list(ego.edges())
+            if len(ego_edges) > 0:
+                match = 0
+                valid = 0
+                for u, v in ego_edges:
+                    l_u = labels_sub[u].item()
+                    l_v = labels_sub[v].item()
+                    if l_u != -1 and l_v != -1:
+                        if l_u == l_v:
+                            match += 1
+                        valid += 1
+                if valid > 0:
+                    homo = match / valid
+                    
+        stats.append([deg, clust, homo, dens])
+        
+    return torch.tensor(stats, dtype=torch.float32, device=device)
 
 def train_gan():
-    print("Loading preprocessed data...")
-    data_dir = "e:/GraphGuard/project-1/dataset/processed"
-    df_nodes = pd.read_csv(os.path.join(data_dir, 'processed_nodes.csv'))
-    df_edges = pd.read_csv(os.path.join(data_dir, 'processed_edges.csv'))
+    print("Loading preprocessed .pt data...")
+    # Fix Issue 1: Correct paths to local processed data
+    data_dir = os.path.join(os.path.dirname(__file__), '..', 'graphguard', 'data', 'processed')
     
-    df_nodes = df_nodes.sort_values('time_step')
+    features = torch.load(os.path.join(data_dir, 'node_features.pt'))
+    labels = torch.load(os.path.join(data_dir, 'labels.pt'))
+    timesteps = torch.load(os.path.join(data_dir, 'timestep.pt'))
+    edge_index = torch.load(os.path.join(data_dir, 'edge_index.pt'))
+    train_mask = torch.load(os.path.join(data_dir, 'train_mask.pt'))
     
-    features = torch.tensor(df_nodes[[f'f{i}' for i in range(1, 166)]].values, dtype=torch.float32)
-    labels = torch.tensor(df_nodes['class_label'].values, dtype=torch.long)
-    timesteps = torch.tensor(df_nodes['time_step'].values, dtype=torch.long)
-    
-    tx_to_idx = {tx: i for i, tx in enumerate(df_nodes['txId'])}
-    
-    df_edges_filtered = df_edges[df_edges['txId1'].isin(tx_to_idx) & df_edges['txId2'].isin(tx_to_idx)]
-    
-    src = torch.tensor([tx_to_idx[tx] for tx in df_edges_filtered['txId1']], dtype=torch.long)
-    dst = torch.tensor([tx_to_idx[tx] for tx in df_edges_filtered['txId2']], dtype=torch.long)
-    edge_index = torch.stack([src, dst], dim=0)
-    
-    print(f"Data ready. {len(features)} nodes, {edge_index.size(1)} edges.")
+    print(f"Data ready. {features.size(0)} nodes, {edge_index.size(1)} edges.")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     features = features.to(device)
     labels = labels.to(device)
     timesteps = timesteps.to(device)
     edge_index = edge_index.to(device)
+    train_mask = train_mask.to(device)
     
-    generator = TemporalGenerator(feat_dim=165).to(device)
-    discriminator = GraphGuardDiscriminator(feat_dim=165).to(device)
+    # Models
+    generator = TemporalGenerator(feat_dim=166).to(device)
+    discriminator = GraphGuardDiscriminator(feat_dim=166).to(device)
+    edge_predictor = EdgePredictor(feat_dim=166).to(device) # Fix Issue 4: Integrate EdgePredictor
     
-    opt_G = optim.Adam(generator.parameters(), lr=1e-4)
+    opt_G = optim.Adam(list(generator.parameters()) + list(edge_predictor.parameters()), lr=1e-4)
     opt_D = optim.Adam(discriminator.parameters(), lr=1e-4)
     
     criterion = nn.BCEWithLogitsLoss()
     
-    illicit_idx = torch.nonzero(labels == 1).squeeze()
+    # Only train on illicit nodes in the train set
+    illicit_train_mask = (labels == 1) & train_mask
+    illicit_idx = torch.nonzero(illicit_train_mask).squeeze()
     
     epochs = 20
     batch_size = 128
     
+    # Determine the results directory
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = f"e:/GraphGuard/project-1/results/generator/run_{timestamp}"
+    run_dir = os.path.join(project_root, "results", "generator", f"run_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
     
     d_loss_history = []
@@ -87,6 +134,7 @@ def train_gan():
     for epoch in range(epochs):
         generator.train()
         discriminator.train()
+        edge_predictor.train()
         
         perm = torch.randperm(illicit_idx.size(0))
         illicit_idx = illicit_idx[perm]
@@ -98,31 +146,57 @@ def train_gan():
             batch_nodes = illicit_idx[i:i+batch_size]
             B = len(batch_nodes)
             
-            if B == 0:
-                continue
+            if B == 0: continue
                 
             real_feats = features[batch_nodes]
             batch_timesteps = timesteps[batch_nodes]
+            
+            # --- Fix Issue 5: Extract K-hop subgraph instead of passing full graph ---
+            subset_real, edge_index_real, mapping_real, _ = get_k_hop_subgraph(
+                batch_nodes, 1, edge_index
+            )
+            
+            sub_feats_real = features[subset_real]
+            sub_labels_real = labels[subset_real]
+            
+            # --- Fix Issue 2: Compute real structural stats ---
+            struct_stats_real = compute_real_stats(edge_index_real, mapping_real, subset_real.size(0), sub_labels_real)
             
             # 1. Train Discriminator
             opt_D.zero_grad()
             
             d_real_node = discriminator.discriminate_node(real_feats)
-            struct_stats_real = compute_structural_stats(edge_index, batch_nodes, features.size(0))
-            d_real_subgraph = discriminator.discriminate_subgraph(features, edge_index, struct_stats_real, batch_nodes)
+            d_real_subgraph = discriminator.discriminate_subgraph(sub_feats_real, edge_index_real, struct_stats_real, mapping_real)
             
-            loss_d_real = criterion(d_real_node, torch.ones_like(d_real_node)) + \
-                          criterion(d_real_subgraph, torch.ones_like(d_real_subgraph))
+            loss_d_real = criterion(d_real_node, torch.ones_like(d_real_node) * 0.9) + \
+                          criterion(d_real_subgraph, torch.ones_like(d_real_subgraph) * 0.9)
                           
-            # Fake
+            # Fake generation
             neigh_feats = aggregate_neighbourhood(features, batch_nodes, edge_index, k_hops=1)
             fake_feats = generator.sample(real_feats, neigh_feats, batch_timesteps, n_samples=1)
             
+            # Fix Issue 4: Edge Prediction for fake nodes
+            # Select candidates from train_mask nodes that are not in the future
+            cand_mask = train_mask
+            cand_idx = torch.nonzero(cand_mask).squeeze()
+            cand_feats = features[cand_idx]
+            cand_ts = timesteps[cand_idx]
+            
+            # We predict edges for the whole batch at once
+            temporal_mask = (cand_ts.unsqueeze(0) <= batch_timesteps.unsqueeze(1))
+            soft_weights, hard_edges = edge_predictor.forward_gumbel(
+                fake_feats, cand_feats, batch_timesteps, cand_ts, temporal_mask
+            )
+            
             d_fake_node = discriminator.discriminate_node(fake_feats.detach())
             
-            features_with_fake = features.clone()
-            features_with_fake[batch_nodes] = fake_feats.detach()
-            d_fake_subgraph = discriminator.discriminate_subgraph(features_with_fake, edge_index, struct_stats_real, batch_nodes)
+            # Build fake subgraph using hard edges (detached for Discriminator training)
+            # For simplicity in subgraph structural eval, we just swap features of the center nodes in the real subgraph
+            # because dynamic subgraph extraction with fake edges requires complex indexing.
+            features_with_fake = sub_feats_real.clone()
+            features_with_fake[mapping_real] = fake_feats.detach()
+            
+            d_fake_subgraph = discriminator.discriminate_subgraph(features_with_fake, edge_index_real, struct_stats_real, mapping_real)
             
             loss_d_fake = criterion(d_fake_node, torch.zeros_like(d_fake_node)) + \
                           criterion(d_fake_subgraph, torch.zeros_like(d_fake_subgraph))
@@ -131,16 +205,20 @@ def train_gan():
             loss_d.backward()
             opt_D.step()
             
-            # 2. Train Generator
+            # 2. Train Generator & Edge Predictor
             opt_G.zero_grad()
             
             d_fake_node_g = discriminator.discriminate_node(fake_feats)
-            features_with_fake_g = features.clone()
-            features_with_fake_g[batch_nodes] = fake_feats
-            d_fake_subgraph_g = discriminator.discriminate_subgraph(features_with_fake_g, edge_index, struct_stats_real, batch_nodes)
+            features_with_fake_g = sub_feats_real.clone()
+            features_with_fake_g[mapping_real] = fake_feats
+            d_fake_subgraph_g = discriminator.discriminate_subgraph(features_with_fake_g, edge_index_real, struct_stats_real, mapping_real)
             
-            loss_g = criterion(d_fake_node_g, torch.ones_like(d_fake_node_g)) + \
-                     criterion(d_fake_subgraph_g, torch.ones_like(d_fake_subgraph_g))
+            loss_g_node = criterion(d_fake_node_g, torch.ones_like(d_fake_node_g))
+            loss_g_struct = criterion(d_fake_subgraph_g, torch.ones_like(d_fake_subgraph_g))
+            loss_fm = feature_matching_loss(real_feats, fake_feats)
+            loss_temporal = temporal_violation_penalty(soft_weights, batch_timesteps, cand_ts)
+            
+            loss_g = loss_g_node + loss_g_struct + (0.1 * loss_fm) + (1.0 * loss_temporal)
                      
             loss_g.backward()
             opt_G.step()
@@ -153,6 +231,7 @@ def train_gan():
         d_loss_history.append(avg_d_loss)
         g_loss_history.append(avg_g_loss)
         
+        edge_predictor.anneal_temperature(epoch)
         print(f"Epoch {epoch+1}/{epochs} - D Loss: {avg_d_loss:.4f} - G Loss: {avg_g_loss:.4f}")
         
     print(f"Training complete. Saving results to {run_dir}...")
@@ -178,10 +257,13 @@ def train_gan():
     with open(os.path.join(run_dir, 'metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=4)
         
-    os.makedirs("e:/GraphGuard/project-1/graphguard/models/trained", exist_ok=True)
-    torch.save(generator.state_dict(), "e:/GraphGuard/project-1/graphguard/models/trained/generator.pt")
+    models_dir = os.path.join(project_root, "graphguard", "models", "trained")
+    os.makedirs(models_dir, exist_ok=True)
+    
+    torch.save(generator.state_dict(), os.path.join(models_dir, "generator.pt"))
+    torch.save(edge_predictor.state_dict(), os.path.join(models_dir, "edge_predictor.pt"))
     torch.save(generator.state_dict(), os.path.join(run_dir, "generator.pt"))
-    print("Generator saved locally.")
+    print("Generator and Edge Predictor saved locally.")
 
 if __name__ == "__main__":
     train_gan()

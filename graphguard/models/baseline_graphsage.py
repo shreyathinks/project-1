@@ -85,5 +85,8 @@ class GraphSAGEClassifier(nn.Module):
         return h
 
     def predict_proba(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """Return softmax probabilities."""
-        return F.softmax(self.forward(x, edge_index), dim=-1)
+        """Return probabilities (sigmoid for binary, softmax for multi-class)."""
+        logits = self.forward(x, edge_index)
+        if logits.shape[-1] == 1:
+            return torch.sigmoid(logits)
+        return F.softmax(logits, dim=-1)

@@ -89,8 +89,12 @@ def evaluate_model(
     model.eval()
     with torch.no_grad():
         logits = model(x.to(device), edge_index.to(device))
-        probs  = torch.softmax(logits, dim=-1)[:, 1]  # P(illicit)
-        preds  = logits.argmax(dim=-1)
+        if logits.shape[-1] == 1:
+            probs = torch.sigmoid(logits).squeeze(-1)
+            preds = (probs >= 0.5).long()
+        else:
+            probs  = torch.softmax(logits, dim=-1)[:, 1]  # P(illicit)
+            preds  = logits.argmax(dim=-1)
 
     y_true = y[mask].cpu().numpy()
     y_pred = preds[mask].cpu().numpy()

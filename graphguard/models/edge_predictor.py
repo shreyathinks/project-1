@@ -80,7 +80,10 @@ class EdgePredictor(nn.Module):
         """
         B, C = synth_feats.size(0), cand_feats.size(0)
         # Mask future candidates (set their logits to -inf)
-        t_mask = temporal_mask.unsqueeze(0).expand(B, -1)  # [B, C]
+        if temporal_mask.dim() == 1:
+            t_mask = temporal_mask.unsqueeze(0).expand(B, -1)  # [B, C]
+        else:
+            t_mask = temporal_mask  # [B, C]
 
         all_logits = []
         for i in range(B):
@@ -126,12 +129,14 @@ class EdgePredictor(nn.Module):
         """
         B = synth_feats.size(0)
         result = []
+        is_2d = (temporal_mask.dim() == 2)
         for i in range(B):
             logits = self.score_candidates(
                 synth_feats[i], cand_feats, synth_ts[i].item(), cand_ts
             )
-            logits[~temporal_mask] = float("-inf")
-            k = min(self.k, (temporal_mask).sum().item())
+            mask_i = temporal_mask[i] if is_2d else temporal_mask
+            logits[~mask_i] = float("-inf")
+            k = min(self.k, mask_i.sum().item())
             _, idx = logits.topk(k)
             result.append(idx)
         return result
