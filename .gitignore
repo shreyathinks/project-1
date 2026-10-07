@@ -19,14 +19,17 @@ venv.bak/
 dataset/
 results/
 mlruns/
-graphguard/models/trained/
 
 # IDEs and OS files
 .vscode/
 .idea/
+.ipynb_checkpoints/
 .DS_Store
 Thumbs.db
 
 # Environment variables
 .env
 .env.*
+
+# Additional ignores
+graphguard_colab.zip
