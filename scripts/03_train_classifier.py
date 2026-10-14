@@ -45,18 +45,19 @@ def train_classifier():
     timesteps = timesteps.to(device)
     edge_index = edge_index.to(device)
     
-    real_train_idx = torch.nonzero(train_mask).squeeze().to(device)
-    val_idx = torch.nonzero(val_mask).squeeze().to(device)
-    test_idx = torch.nonzero(test_mask).squeeze().to(device)
+    # Filter out label 2 (unknown) to avoid multiclass error in metrics
+    real_train_idx = torch.nonzero(train_mask & (y != 2)).squeeze().to(device)
+    val_idx = torch.nonzero(val_mask & (y != 2)).squeeze().to(device)
+    test_idx = torch.nonzero(test_mask & (y != 2)).squeeze().to(device)
     
     print("Loading Generator and Edge Predictor for Oversampling...")
-    generator = TemporalGenerator(feat_dim=166).to(device)
-    edge_predictor = EdgePredictor(feat_dim=166).to(device)
+    generator = TemporalGenerator(feat_dim=165).to(device)
+    edge_predictor = EdgePredictor(feat_dim=165).to(device)
     
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    models_dir = os.path.join(project_root, "graphguard", "models", "trained")
-    gen_path = os.path.join(models_dir, "generator.pt")
-    ep_path = os.path.join(models_dir, "edge_predictor.pt")
+    models_dir = os.path.join(project_root, "graphguard", "models")
+    gen_path = os.path.join(models_dir, "graphguard_generator.pt")
+    ep_path = os.path.join(models_dir, "graphguard_edge_predictor.pt")
     
     num_illicit = (y[real_train_idx] == 1).sum().item()
     num_licit = (y[real_train_idx] == 0).sum().item()
@@ -96,31 +97,54 @@ def train_classifier():
         print("Injecting edges for synthetic nodes via trained EdgePredictor...")
         
         cand_feats = X[:len(X)-num_to_generate]
-        cand_ts = timesteps[:len(timesteps)-num_to_generate]
+        cand_ts = timesteps
         cand_idx_tensor = torch.arange(len(cand_feats), device=device)
         
         new_src = []
         new_dst = []
         
         batch_size = 500
+        
+        lin1 = edge_predictor.scorer[0]
+        W_s = lin1.weight[:, :165]
+        W_c = lin1.weight[:, 165:330]
+        W_t = lin1.weight[:, 330:]
+        b = lin1.bias
+        
+        term2 = cand_feats @ W_c.T  # [C, hidden_dim]
+        
         with torch.no_grad():
-            for i in range(0, num_to_generate, batch_size):
-                end = min(i + batch_size, num_to_generate)
-                batch_synth_feats = synthetic_feats[i:end]
-                batch_synth_ts = seed_timesteps[i:end]
+            for i in range(num_to_generate):
+                if i % 2000 == 0:
+                    print(f"Injected edges for {i}/{num_to_generate} nodes...")
                 
-                temporal_mask = (cand_ts.unsqueeze(0) <= batch_synth_ts.unsqueeze(1))
+                s_feat = synthetic_feats[i]
+                s_ts = seed_timesteps[i]
                 
-                topk_indices_list = edge_predictor.select_topk(
-                    batch_synth_feats, cand_feats, batch_synth_ts, cand_ts, temporal_mask
-                )
+                term1 = s_feat @ W_s.T
+                delta_t = (s_ts - cand_ts).float().abs().unsqueeze(-1)
+                term3 = delta_t @ W_t.T
                 
-                for local_i, neighbors in enumerate(topk_indices_list):
-                    synth_node_id = synth_idx[i + local_i].item()
-                    for neighbor_local in neighbors:
-                        neighbor_global = cand_idx_tensor[neighbor_local.item()].item()
-                        new_src.extend([synth_node_id, neighbor_global])
-                        new_dst.extend([neighbor_global, synth_node_id])
+                pre = term1.unsqueeze(0) + term2 + term3 + b.unsqueeze(0)
+                
+                h = edge_predictor.scorer[1](pre)
+                h = edge_predictor.scorer[2](h)
+                h = edge_predictor.scorer[3](h)
+                h = edge_predictor.scorer[4](h)
+                h = edge_predictor.scorer[5](h)
+                logits = h.squeeze(-1)
+                
+                temporal_mask_i = cand_ts <= s_ts
+                logits[~temporal_mask_i] = float("-inf")
+                
+                k = min(edge_predictor.k, temporal_mask_i.sum().item())
+                _, neighbors = logits.topk(k)
+                
+                synth_node_id = synth_idx[i].item()
+                for neighbor_local in neighbors:
+                    neighbor_global = cand_idx_tensor[neighbor_local.item()].item()
+                    new_src.extend([synth_node_id, neighbor_global])
+                    new_dst.extend([neighbor_global, synth_node_id])
                         
         new_edges = torch.tensor([new_src, new_dst], dtype=torch.long, device=device)
         edge_index = torch.cat([edge_index, new_edges], dim=1)
@@ -134,7 +158,7 @@ def train_classifier():
     edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
     
     # Initialize GraphSAGE
-    model = GraphSAGEClassifier(in_channels=166, hidden_channels=256, out_channels=1).to(device)
+    model = GraphSAGEClassifier(in_channels=165, hidden_channels=256, out_channels=1).to(device)
     opt = optim.Adam(model.parameters(), lr=5e-3, weight_decay=1e-5)
     criterion = nn.BCEWithLogitsLoss()
     

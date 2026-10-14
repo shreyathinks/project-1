@@ -104,9 +104,9 @@ def train_gan():
     train_mask = train_mask.to(device)
     
     # Models
-    generator = TemporalGenerator(feat_dim=166).to(device)
-    discriminator = GraphGuardDiscriminator(feat_dim=166).to(device)
-    edge_predictor = EdgePredictor(feat_dim=166).to(device) # Fix Issue 4: Integrate EdgePredictor
+    generator = TemporalGenerator(feat_dim=165).to(device)
+    discriminator = GraphGuardDiscriminator(feat_dim=165).to(device)
+    edge_predictor = EdgePredictor(feat_dim=165).to(device) # Fix Issue 4: Integrate EdgePredictor
     
     opt_G = optim.Adam(list(generator.parameters()) + list(edge_predictor.parameters()), lr=1e-4)
     opt_D = optim.Adam(discriminator.parameters(), lr=1e-4)
@@ -117,7 +117,7 @@ def train_gan():
     illicit_train_mask = (labels == 1) & train_mask
     illicit_idx = torch.nonzero(illicit_train_mask).squeeze()
     
-    epochs = 20
+    epochs = 100
     batch_size = 128
     
     # Determine the results directory
@@ -179,6 +179,12 @@ def train_gan():
             # Select candidates from train_mask nodes that are not in the future
             cand_mask = train_mask
             cand_idx = torch.nonzero(cand_mask).squeeze()
+            
+            # --- FIX OOM: Subsample candidates ---
+            if cand_idx.size(0) > 2000:
+                perm = torch.randperm(cand_idx.size(0))[:2000]
+                cand_idx = cand_idx[perm]
+                
             cand_feats = features[cand_idx]
             cand_ts = timesteps[cand_idx]
             
@@ -234,6 +240,11 @@ def train_gan():
         edge_predictor.anneal_temperature(epoch)
         print(f"Epoch {epoch+1}/{epochs} - D Loss: {avg_d_loss:.4f} - G Loss: {avg_g_loss:.4f}")
         
+        # Save checkpoints every 20 epochs
+        if (epoch + 1) % 20 == 0:
+            torch.save(generator.state_dict(), os.path.join(run_dir, f"generator_epoch_{epoch+1}.pt"))
+            torch.save(edge_predictor.state_dict(), os.path.join(run_dir, f"edge_predictor_epoch_{epoch+1}.pt"))
+        
     print(f"Training complete. Saving results to {run_dir}...")
         
     # Save Loss Plot
@@ -257,12 +268,12 @@ def train_gan():
     with open(os.path.join(run_dir, 'metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=4)
         
-    models_dir = os.path.join(project_root, "graphguard", "models", "trained")
+    models_dir = os.path.join(project_root, "graphguard", "models")
     os.makedirs(models_dir, exist_ok=True)
     
-    torch.save(generator.state_dict(), os.path.join(models_dir, "generator.pt"))
-    torch.save(edge_predictor.state_dict(), os.path.join(models_dir, "edge_predictor.pt"))
-    torch.save(generator.state_dict(), os.path.join(run_dir, "generator.pt"))
+    torch.save(generator.state_dict(), os.path.join(models_dir, "graphguard_generator.pt"))
+    torch.save(edge_predictor.state_dict(), os.path.join(models_dir, "graphguard_edge_predictor.pt"))
+    torch.save(generator.state_dict(), os.path.join(run_dir, "graphguard_generator.pt"))
     print("Generator and Edge Predictor saved locally.")
 
 if __name__ == "__main__":

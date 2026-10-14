@@ -51,7 +51,7 @@ class NodeDiscriminator(nn.Module):
     Uses spectral normalisation for training stability.
     """
 
-    def __init__(self, feat_dim: int = 166, hidden_dim: int = 256):
+    def __init__(self, feat_dim: int = 165, hidden_dim: int = 256):
         super().__init__()
         self.net = nn.Sequential(
             nn.utils.spectral_norm(nn.Linear(feat_dim, hidden_dim)),
@@ -85,7 +85,7 @@ class StructuralDiscriminator(nn.Module):
 
     def __init__(
         self,
-        feat_dim: int = 166,
+        feat_dim: int = 165,
         struct_dim: int = 4,   # degree, clustering, homophily, ego_density
         hidden_dim: int = 128,
     ):
@@ -143,7 +143,7 @@ class GraphGuardDiscriminator(nn.Module):
 
     def __init__(
         self,
-        feat_dim: int = 166,
+        feat_dim: int = 165,
         struct_dim: int = 4,
         hidden_a: int = 256,
         hidden_b: int = 128,

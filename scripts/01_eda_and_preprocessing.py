@@ -3,6 +3,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch
 
 def load_data(dataset_dir):
     print("Loading data...")
@@ -71,37 +72,70 @@ def perform_eda(df, output_dir):
 def robust_preprocessing(df, df_edges, output_dir):
     print("Performing robust preprocessing...")
     os.makedirs(output_dir, exist_ok=True)
+    
     # Map classes to numeric: unknown -> -1, 1 (illicit) -> 1, 2 (licit) -> 0
     class_mapping = {'unknown': -1, '1': 1, '2': 0}
     df['class_label'] = df['class'].map(class_mapping)
     
-    # Separate features
+    # 1. Map txId to contiguous integers 0 to N-1
+    print("Mapping txIds to contiguous indices...")
+    tx_ids = df['txId'].values
+    tx_id_map = {tx_id: i for i, tx_id in enumerate(tx_ids)}
+    
+    # Map edges using the dictionary
+    df_edges['mapped_txId1'] = df_edges['txId1'].map(tx_id_map)
+    df_edges['mapped_txId2'] = df_edges['txId2'].map(tx_id_map)
+    
+    # Drop rows where edge points to an unknown txId not in features (if any)
+    df_edges = df_edges.dropna(subset=['mapped_txId1', 'mapped_txId2'])
+    
+    # 2. Separate features and apply global robust scaler
+    print("Scaling features...")
     features = df.drop(columns=['txId', 'time_step', 'class', 'class_label'])
-    
-    # Instead of per-timestep z-score, we apply a global robust scaler
-    # This prevents NaN issues when a feature has 0 variance in a specific timestep
     from sklearn.preprocessing import RobustScaler
-    
     scaler = RobustScaler()
     scaled_features = scaler.fit_transform(features)
     
-    # Assign back
-    df_scaled = df.copy()
-    df_scaled[features.columns] = scaled_features
+    # 3. Create Train / Val / Test Masks
+    # Elliptic typical split: Train (1-34), Val (35-39), Test (40-49)
+    print("Generating temporal masks...")
+    time_steps = df['time_step'].values
+    train_mask = (time_steps <= 34)
+    val_mask = (time_steps > 34) & (time_steps <= 39)
+    test_mask = (time_steps > 39)
     
-    print(f"Features scaled successfully. Any NaNs? {np.isnan(scaled_features).any()}")
+    # 4. Convert to PyTorch tensors
+    print("Converting to PyTorch tensors...")
+    node_features_t = torch.tensor(scaled_features, dtype=torch.float32)
+    labels_t = torch.tensor(df['class_label'].values, dtype=torch.long)
+    timestep_t = torch.tensor(time_steps, dtype=torch.long)
     
-    # Save processed data
-    # We will save node features and edges for model consumption
-    print("Saving preprocessed data...")
-    df_scaled.to_csv(os.path.join(output_dir, 'processed_nodes.csv'), index=False)
-    df_edges.to_csv(os.path.join(output_dir, 'processed_edges.csv'), index=False)
-    print("Preprocessing complete.")
+    edge_index_t = torch.tensor(
+        df_edges[['mapped_txId1', 'mapped_txId2']].values.T, 
+        dtype=torch.long
+    )
+    
+    train_mask_t = torch.tensor(train_mask, dtype=torch.bool)
+    val_mask_t = torch.tensor(val_mask, dtype=torch.bool)
+    test_mask_t = torch.tensor(test_mask, dtype=torch.bool)
+    
+    # 5. Save all tensors
+    print("Saving .pt tensors...")
+    torch.save(node_features_t, os.path.join(output_dir, 'node_features.pt'))
+    torch.save(labels_t, os.path.join(output_dir, 'labels.pt'))
+    torch.save(timestep_t, os.path.join(output_dir, 'timestep.pt'))
+    torch.save(edge_index_t, os.path.join(output_dir, 'edge_index.pt'))
+    torch.save(train_mask_t, os.path.join(output_dir, 'train_mask.pt'))
+    torch.save(val_mask_t, os.path.join(output_dir, 'val_mask.pt'))
+    torch.save(test_mask_t, os.path.join(output_dir, 'test_mask.pt'))
+    
+    print("Preprocessing complete and ready for model training.")
 
 if __name__ == "__main__":
-    dataset_dir = "e:/GraphGuard/project-1/dataset/elliptic_bitcoin_dataset"
-    output_dir = "e:/GraphGuard/project-1/dataset/processed"
-    eda_output_dir = "e:/GraphGuard/project-1/dataset/eda"
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    dataset_dir = os.path.join(project_root, "graphguard", "data", "raw")
+    output_dir = os.path.join(project_root, "graphguard", "data", "processed")
+    eda_output_dir = os.path.join(project_root, "results", "eda")
     
     df, df_edges = load_data(dataset_dir)
     perform_eda(df, eda_output_dir)

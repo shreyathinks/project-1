@@ -28,7 +28,7 @@ class EdgePredictor(nn.Module):
 
     def __init__(
         self,
-        feat_dim: int = 166,
+        feat_dim: int = 165,
         hidden_dim: int = 256,
         k: int = 5,
         tau_init: float = 1.0,

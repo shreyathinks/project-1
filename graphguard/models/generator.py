@@ -108,7 +108,7 @@ class TemporalGenerator(nn.Module):
 
     def __init__(
         self,
-        feat_dim: int = 166,
+        feat_dim: int = 165,
         noise_dim: int = 64,
         pe_dim: int = 64,
         hidden_dim: int = 512,
