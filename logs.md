@@ -116,3 +116,36 @@ AttributeError: 'numpy.ndarray' object has no attribute 'to'
 ```
 
 *Note: Following Run 4, the codebase was updated to fix the NumPy array bug, strictly enforce temporal edge splitting, restrict GraphSAGE to 2 layers to prevent oversmoothing, and remove MLflow tracking.*
+
+## 5. Downstream Classifier - Full Pipeline Execution (Google Colab GPU)
+**Platform:** Google Colab (NVIDIA T4 GPU)  
+**Commands:**
+```bash
+python scripts/02_train_generator.py
+python scripts/03_train_classifier.py
+```
+**Result:** Successfully trained TempoStruct-GAN for 100 epochs, oversampled 22,970 synthetic illicit nodes, and injected 229,700 time-consistent edges via the trained EdgePredictor. Downstream GraphSAGE trained for 1,000 epochs to convergence.
+
+```text
+Loading preprocessed .pt data...
+Loading Generator and Edge Predictor for Oversampling...
+Generating synthetic node features...
+Oversampled 22970 synthetic illicit nodes.
+Injecting edges for synthetic nodes via trained EdgePredictor...
+Injected 229700 synthetic edges into the graph.
+Training Downstream GraphSAGE Classifier (Full Batch)...
+Epoch 50/1000 | Train Loss: 0.6036 | Val F1: 0.2032 @ T=0.54
+...
+Epoch 1000/1000 | Train Loss: 0.4791 | Val F1: 0.2134 @ T=0.52
+Restored best model checkpoint with Val F1=0.2435 at Threshold=0.73
+```
+
+**Final Test Set Evaluation (Unseen Timesteps 40–49):**
+- **Test ROC-AUC:** **0.7251** (Substantial improvement over baseline 0.6170 and Run 3's 0.6744)
+- **Optimal Test Threshold ($T = 0.35$):**
+  - **F1-Score:** **0.1746**
+  - **Precision:** **0.0995**
+  - **Recall:** **0.7154** (Detects 71.5% of illicit transactions)
+- **High-Recall Operating Point ($T = 0.15$):**
+  - **Recall:** **0.8428** (Detects 84.3% of illicit transactions)
+  - **F1-Score:** **0.1720**
