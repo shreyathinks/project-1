@@ -45,10 +45,10 @@ def train_classifier():
     timesteps = timesteps.to(device)
     edge_index = edge_index.to(device)
     
-    # Filter out label 2 (unknown) to avoid multiclass error in metrics
-    real_train_idx = torch.nonzero(train_mask & (y != 2)).squeeze().to(device)
-    val_idx = torch.nonzero(val_mask & (y != 2)).squeeze().to(device)
-    test_idx = torch.nonzero(test_mask & (y != 2)).squeeze().to(device)
+    # Filter out label -1 (unknown) to avoid multiclass error in metrics and invalid BCE targets
+    real_train_idx = torch.nonzero(train_mask & (y != -1)).squeeze().to(device)
+    val_idx = torch.nonzero(val_mask & (y != -1)).squeeze().to(device)
+    test_idx = torch.nonzero(test_mask & (y != -1)).squeeze().to(device)
     
     print("Loading Generator and Edge Predictor for Oversampling...")
     generator = TemporalGenerator(feat_dim=165).to(device)
