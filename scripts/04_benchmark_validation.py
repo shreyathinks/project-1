@@ -137,17 +137,17 @@ def run_rigorous_validation():
     generator.load_state_dict(torch.load(gen_path, map_location=device))
     generator.eval()
     
-    # Sample from training era illicit seeds
-    real_illicit_tensor_idx = train_idx[y_t[train_idx] == 1].to(device)
+    # Sample from training era illicit seeds on CPU, then send to device
+    real_illicit_tensor_idx = train_idx[y_t[train_idx] == 1]
     torch.manual_seed(42)
-    sample_idx = torch.randint(0, len(real_illicit_tensor_idx), (num_to_augment,), device=device)
+    sample_idx = torch.randint(0, len(real_illicit_tensor_idx), (num_to_augment,))
     seed_node_idx = real_illicit_tensor_idx[sample_idx]
     
     seed_feats = X_t[seed_node_idx].to(device)
     seed_timesteps = timesteps_t[seed_node_idx].to(device)
     
     # Neighborhood aggregation strictly on training graph
-    neigh_feats = aggregate_neighbourhood(X_t.to(device), seed_node_idx, edge_index_t.to(device), k_hops=1)
+    neigh_feats = aggregate_neighbourhood(X_t.to(device), seed_node_idx.to(device), edge_index_t.to(device), k_hops=1)
     with torch.no_grad():
         gg_synthetic_feats = generator.sample(seed_feats, neigh_feats, seed_timesteps, n_samples=1).cpu().numpy()
         
