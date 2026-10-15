@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import datetime
 import json
+import copy
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -44,6 +45,9 @@ def train_classifier():
     y = y.to(device).float()
     timesteps = timesteps.to(device)
     edge_index = edge_index.to(device)
+    train_mask = train_mask.to(device)
+    val_mask = val_mask.to(device)
+    test_mask = test_mask.to(device)
     
     # Filter out label -1 (unknown) to avoid multiclass error in metrics and invalid BCE targets
     real_train_idx = torch.nonzero(train_mask & (y != -1)).squeeze().to(device)
@@ -176,6 +180,7 @@ def train_classifier():
     print("Training Downstream GraphSAGE Classifier (Full Batch)...")
     best_val_f1 = 0
     best_thresh = 0.5
+    best_model_weights = None
     for epoch in range(epochs):
         model.train()
         opt.zero_grad()
@@ -197,6 +202,7 @@ def train_classifier():
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
                 best_thresh = thresh
+                best_model_weights = copy.deepcopy(model.state_dict())
             
         train_loss_hist.append(loss.item())
         val_loss_hist.append(val_loss)
@@ -204,6 +210,10 @@ def train_classifier():
         
         if (epoch + 1) % 50 == 0:
             print(f"Epoch {epoch+1}/{epochs} | Train Loss: {loss.item():.4f} | Val F1: {val_f1:.4f} @ T={thresh:.2f}")
+
+    if best_model_weights is not None:
+        model.load_state_dict(best_model_weights)
+        print(f"Restored best model checkpoint with Val F1={best_val_f1:.4f} at Threshold={best_thresh:.2f}")
 
     print("Evaluating on Test Set...")
     model.eval()
@@ -253,6 +263,7 @@ def train_classifier():
         json.dump(metrics, f, indent=4)
     
     os.makedirs(models_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(models_dir, "graphguard_classifier.pt"))
     torch.save(model.state_dict(), os.path.join(models_dir, "graphsage.pt"))
     torch.save(model.state_dict(), os.path.join(run_dir, "graphsage.pt"))
     print("Classifier saved locally.")
