@@ -149,3 +149,27 @@ Restored best model checkpoint with Val F1=0.2435 at Threshold=0.73
 - **High-Recall Operating Point ($T = 0.15$):**
   - **Recall:** **0.8428** (Detects 84.3% of illicit transactions)
   - **F1-Score:** **0.1720**
+
+## 6. Downstream Classifier - Precision & Skip Connection Optimization (Run 20261019_165715)
+**Platform:** Local CPU  
+**Command:**
+```bash
+python scripts/03_train_classifier.py --epochs 200 --aug_ratio 0.30 --top_k 2 --loss focal --threshold_metric f0.5
+```
+**Architecture Enhancements Applied:**
+1. **Unidirectional synthetic edges:** Prevented reverse feature bleed from synthetic illicit nodes into real nodes.
+2. **Ego-feature residual skip connection:** Concatenated raw 165 local features with Layer 1 and Layer 2 SAGE embeddings (677 dimensions) with LayerNorm + Dropout.
+3. **Calibrated 30% augmentation ratio:** +1,038 nodes instead of +22,970 nodes to prevent prior probability shift.
+4. **Top-K=2 directed graph sparsity:** Matches true Elliptic density (~1.15 directed edges per node).
+5. **Binary Focal Loss (`alpha=0.25`, `gamma=2.0`):** Down-weighted easy licit examples, focusing on hard decision boundaries.
+6. **Validation $F_{0.5}$ threshold calibration:** Tuned operating point on validation set to control false alarms.
+
+**Final Test Set Evaluation (Unseen Timesteps 40–49, 11,184 nodes):**
+- **Test Precision:** **0.8926 (89.26%)** *(A massive ~9x increase from 9.95%)*
+- **Test ROC-AUC:** **0.8346 (83.46%)** *(Substantial improvement over Run 5's 0.7251)*
+- **Test PR-AUC:** **0.5532 (55.32%)** *(Dramatic boost from ~0.14)*
+- **Test Illicit F1-Score:** **0.4920 (49.20%)** *(Nearly tripled from 0.1746)*
+- **Test Illicit F0.5-Score:** **0.6733 (67.33%)**
+- **Test Illicit Recall:** **0.3396 (33.96%)** *(Detects 216 illicit transactions with only 26 false alarms)*
+- **Optimal Validation Threshold:** **$T = 0.52$** (Val $F_{0.5} = 0.8289$)
+

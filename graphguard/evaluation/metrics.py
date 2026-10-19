@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from sklearn.metrics import (
     f1_score,
+    fbeta_score,
     recall_score,
     precision_score,
     roc_auc_score,
@@ -40,7 +41,7 @@ def compute_classification_metrics(
         verbose:      If True, prints sklearn classification report.
 
     Returns:
-        dict with keys: illicit_f1, illicit_recall, illicit_precision,
+        dict with keys: illicit_f1, illicit_f05, illicit_recall, illicit_precision,
                         auc_roc, auc_pr, macro_f1
     """
     mask = y_true != -1
@@ -49,6 +50,7 @@ def compute_classification_metrics(
     y_prob = y_prob[mask]
 
     illicit_f1      = f1_score(y_true, y_pred, pos_label=target_class, zero_division=0)
+    illicit_f05     = fbeta_score(y_true, y_pred, beta=0.5, pos_label=target_class, zero_division=0)
     illicit_recall  = recall_score(y_true, y_pred, pos_label=target_class, zero_division=0)
     illicit_prec    = precision_score(y_true, y_pred, pos_label=target_class, zero_division=0)
     macro_f1        = f1_score(y_true, y_pred, average="macro", zero_division=0)
@@ -66,12 +68,51 @@ def compute_classification_metrics(
 
     return {
         "illicit_f1":        illicit_f1,
+        "illicit_f05":       illicit_f05,
         "illicit_recall":    illicit_recall,
         "illicit_precision": illicit_prec,
         "auc_roc":           auc_roc,
         "auc_pr":            auc_pr,
         "macro_f1":          macro_f1,
     }
+
+
+def optimize_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    metric: str = "f0.5",
+    beta: float = 0.5,
+    num_thresholds: int = 100,
+) -> tuple[float, float]:
+    """
+    Tune the decision threshold strictly on validation probabilities.
+    metric: 'f0.5' (weights precision 2x over recall, guarding against false alarms),
+            'f1' (standard harmonic mean), or 'precision'.
+    Returns: (best_threshold, best_score)
+    """
+    mask = y_true != -1
+    y_true = y_true[mask]
+    y_prob = y_prob[mask]
+
+    thresholds = np.linspace(0.01, 0.99, num_thresholds)
+    best_score = 0.0
+    best_thresh = 0.5
+
+    for t in thresholds:
+        preds = (y_prob >= t).astype(int)
+        if metric == "f0.5":
+            score = fbeta_score(y_true, preds, beta=beta, pos_label=1, zero_division=0)
+        elif metric == "precision":
+            score = precision_score(y_true, preds, pos_label=1, zero_division=0)
+        else:
+            score = f1_score(y_true, preds, pos_label=1, zero_division=0)
+
+        if score > best_score:
+            best_score = score
+            best_thresh = t
+
+    return float(best_thresh), float(best_score)
+
 
 
 def evaluate_model(

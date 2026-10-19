@@ -46,16 +46,18 @@ def _get_conv(in_channels: int, out_channels: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3-layer GraphSAGE classifier
+# GraphSAGE classifier with Ego-Feature Residual Skip Connections
 # ─────────────────────────────────────────────────────────────────────────────
 class GraphSAGEClassifier(nn.Module):
     """
-    Two-layer GraphSAGE for node classification.
+    Two-layer GraphSAGE with Ego-Feature Residual Skip Connection.
+    Concatenates raw node features x_v, Layer 1 embedding h1, and Layer 2
+    embedding h2 before classification to prevent oversmoothing sharp local features.
 
     Args:
-        in_channels:  Number of input node features (166 for Elliptic).
+        in_channels:  Number of input node features (165 for Elliptic).
         hidden_channels: Hidden dimension (default 256).
-        out_channels: Number of output classes (2 for binary fraud detection).
+        out_channels: Number of output classes (1 for binary logit, 2 for softmax).
         dropout: Dropout probability applied between layers.
     """
 
@@ -63,26 +65,40 @@ class GraphSAGEClassifier(nn.Module):
         self,
         in_channels: int,
         hidden_channels: int = 256,
-        out_channels: int = 2,
+        out_channels: int = 1,
         dropout: float = 0.3,
     ):
         super().__init__()
         self.dropout = dropout
 
         self.conv1 = _get_conv(in_channels, hidden_channels)
-        self.conv2 = _get_conv(hidden_channels, out_channels)
-
         self.bn1 = nn.BatchNorm1d(hidden_channels)
 
-        # Removed third layer and dedicated linear classifier, conv2 now outputs directly to out_channels
+        self.conv2 = _get_conv(hidden_channels, hidden_channels)
+        self.bn2 = nn.BatchNorm1d(hidden_channels)
+
+        # Skip connection: raw features + h1 + h2
+        cat_dim = in_channels + hidden_channels + hidden_channels
+        self.norm = nn.LayerNorm(cat_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(cat_dim, hidden_channels // 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels // 2, out_channels),
+        )
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        h = F.leaky_relu(self.bn1(self.conv1(x, edge_index)), 0.2)
-        h = F.dropout(h, p=self.dropout, training=self.training)
-        h = self.conv2(h, edge_index)
-        
-        return h
+        h1 = F.leaky_relu(self.bn1(self.conv1(x, edge_index)), 0.2)
+        h1_drop = F.dropout(h1, p=self.dropout, training=self.training)
+
+        h2 = F.leaky_relu(self.bn2(self.conv2(h1_drop, edge_index)), 0.2)
+
+        # Concatenate raw local features x, 1st hop h1, and 2nd hop h2
+        h_cat = torch.cat([x, h1, h2], dim=-1)
+        h_norm = F.dropout(self.norm(h_cat), p=self.dropout, training=self.training)
+
+        return self.classifier(h_norm)
 
     def predict_proba(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """Return probabilities (sigmoid for binary, softmax for multi-class)."""
@@ -90,3 +106,4 @@ class GraphSAGEClassifier(nn.Module):
         if logits.shape[-1] == 1:
             return torch.sigmoid(logits)
         return F.softmax(logits, dim=-1)
+
