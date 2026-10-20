@@ -149,3 +149,58 @@ Restored best model checkpoint with Val F1=0.2435 at Threshold=0.73
 - **High-Recall Operating Point ($T = 0.15$):**
   - **Recall:** **0.8428** (Detects 84.3% of illicit transactions)
   - **F1-Score:** **0.1720**
+
+## 6. Downstream Classifier - Precision & Skip Connection Optimization (Run 20261019_165715)
+**Platform:** Local CPU  
+**Command:**
+```bash
+python scripts/03_train_classifier.py --epochs 200 --aug_ratio 0.30 --top_k 2 --loss focal --threshold_metric f0.5
+```
+**Architecture Enhancements Applied:**
+1. **Unidirectional synthetic edges:** Prevented reverse feature bleed from synthetic illicit nodes into real nodes.
+2. **Ego-feature residual skip connection:** Concatenated raw 165 local features with Layer 1 and Layer 2 SAGE embeddings (677 dimensions) with LayerNorm + Dropout.
+3. **Calibrated 30% augmentation ratio:** +1,038 nodes instead of +22,970 nodes to prevent prior probability shift.
+4. **Top-K=2 directed graph sparsity:** Matches true Elliptic density (~1.15 directed edges per node).
+5. **Binary Focal Loss (`alpha=0.25`, `gamma=2.0`):** Down-weighted easy licit examples, focusing on hard decision boundaries.
+6. **Validation $F_{0.5}$ threshold calibration:** Tuned operating point on validation set to control false alarms.
+
+**Final Test Set Evaluation (Unseen Timesteps 40–49, 11,184 nodes):**
+- **Test Precision:** **0.8926 (89.26%)** *(A massive ~9x increase from 9.95%)*
+- **Test ROC-AUC:** **0.8346 (83.46%)** *(Substantial improvement over Run 5's 0.7251)*
+- **Test PR-AUC:** **0.5532 (55.32%)** *(Dramatic boost from ~0.14)*
+- **Test Illicit F1-Score:** **0.4920 (49.20%)** *(Nearly tripled from 0.1746)*
+- **Test Illicit F0.5-Score:** **0.6733 (67.33%)**
+- **Test Illicit Recall:** **0.3396 (33.96%)** *(Detects 216 illicit transactions with only 26 false alarms)*
+- **Optimal Validation Threshold:** **$T = 0.52$** (Val $F_{0.5} = 0.8289$)
+
+## 7. Downstream Classifier - High-Recall & Precision Balancing via Goldilocks Wiring (Run 20261019_205103)
+**Platform:** Local CPU  
+**Command:**
+```bash
+python scripts/03_train_classifier.py --epochs 200 --aug_ratio 1.50 --top_k 3 --loss focal --focal_alpha 0.75 --focal_gamma 2.0 --threshold_metric f1
+```
+**Architecture & Algorithmic Enhancements Applied:**
+1. **Recall-Prioritized Focal Loss (`alpha=0.75`, `gamma=2.0`):** Inverted positive class weighting so missed fraud (False Negatives) receives 3x higher loss penalty ($0.75$ vs $0.25$) than false alarms, while $\gamma=2.0$ continues suppressing easy licit loss.
+2. **Class-Conditional "Goldilocks" Synthetic Edge Wiring:**
+   - Edges to real illicit candidates ($y = 1$) are **bidirectional** (`candidate <-> synth`, 870 edges added), actively reinforcing sparse minority fraud clusters.
+   - Edges to licit ($y = 0$) and unlabeled ($y = -1$) candidates are strictly **unidirectional** (`candidate -> synth`, 14,709 edges added), preserving zero feature bleed into normal transaction flows.
+3. **150% Augmentation Budget:** Oversampled +5,193 synthetic illicit nodes (bringing illicit representation to ~25% of labeled training data) with `top_k = 3`.
+4. **Hybrid Mean + Max Neighborhood Aggregation:** Combined neighborhood Mean and Max ($\mathbf{h}_{\mathcal{N}(v)} = \mathbf{h}_{\text{mean}} + 0.5 \cdot \mathbf{h}_{\text{max}}$) to catch camouflaged peeling chains while preserving the 677-dim ego-feature residual skip connection $[\mathbf{x}_v \parallel \mathbf{h}_1 \parallel \mathbf{h}_2]$.
+5. **Multi-Point Validation Threshold Calibration:** Calibrated on Timesteps 35–39 and evaluated across 4 distinct operational thresholds on the untouched Test Set (Timesteps 40–49, 11,184 nodes).
+
+**Final Test Set Evaluation Across Operating Points (Timesteps 40–49):**
+
+| Operating Point | Threshold | TP | FP | FN | TN | Precision | Recall | F1 | F2 | ROC-AUC | PR-AUC |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. Balanced Point (Max $F_1$)** | **0.64** | **269** | **75** | **367** | **10,473** | **78.20%** | **42.30%** | **0.5490** | **0.4657** | **0.8342** | **0.5583** |
+| **2. AML Recall-Priority (Max $F_2$)** | **0.48** | **346** | **281** | **290** | **10,267** | **55.18%** | **54.40%** | **0.5479** | **0.5456** | **0.8342** | **0.5583** |
+| **3. Sweet-Spot Point (Val Rec $\ge 0.65$)** | **0.64** | **269** | **75** | **367** | **10,473** | **78.20%** | **42.30%** | **0.5490** | **0.4657** | **0.8342** | **0.5583** |
+| **4. Ultra-High Precision (Max $F_{0.5}$)** | **0.65** | **266** | **68** | **370** | **10,480** | **79.64%** | **41.82%** | **0.5485** | **0.4621** | **0.8342** | **0.5583** |
+
+**Key Takeaways & Comparison against Run 6:**
+- **PR-AUC increased to 0.5583** (all-time high across all experiments).
+- **Recall at Max $F_2$ reached 54.40%** (+20.44% absolute gain over Run 6's 33.96%), successfully intercepting **346 illicit transactions** (vs 216) while keeping Precision solid at **55.18%**.
+- **Balanced Operating Point ($F_1 = 0.5490$)** raised Recall to **42.30%** with **78.20% Precision**, resulting in only 75 false alarms out of 10,548 legitimate transactions.
+- Zero feature leakage into legitimate transaction chains was preserved via Goldilocks wiring.
+
+

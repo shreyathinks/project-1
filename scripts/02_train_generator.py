@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -40,7 +41,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from graphguard.models.generator import TemporalGenerator, aggregate_neighbourhood
 from graphguard.models.discriminator import GraphGuardDiscriminator
 from graphguard.models.edge_predictor import EdgePredictor
-from graphguard.training.losses import temporal_violation_penalty, generator_loss, feature_matching_loss
+from graphguard.training.losses import (
+    temporal_violation_penalty,
+    generator_loss,
+    feature_matching_loss,
+    local_aggregated_consistency_loss,
+)
 
 def compute_real_stats(subgraph_edge_index, center_nodes_rel, num_nodes, labels_sub=None):
     device = subgraph_edge_index.device
@@ -83,7 +89,18 @@ def compute_real_stats(subgraph_edge_index, center_nodes_rel, num_nodes, labels_
         
     return torch.tensor(stats, dtype=torch.float32, device=device)
 
-def train_gan():
+def train_gan(args=None):
+    if args is None:
+        parser = argparse.ArgumentParser(description="Train GraphGuard Generator and EdgePredictor")
+        parser.add_argument("--epochs", type=int, default=100)
+        parser.add_argument("--batch_size", type=int, default=128)
+        parser.add_argument("--top_k", type=int, default=2)
+        parser.add_argument("--lr", type=float, default=1e-4)
+        parser.add_argument("--lambda_fm", type=float, default=0.1)
+        parser.add_argument("--lambda_temp", type=float, default=1.0)
+        parser.add_argument("--lambda_cons", type=float, default=0.1)
+        args, _ = parser.parse_known_args()
+
     print("Loading preprocessed .pt data...")
     # Fix Issue 1: Correct paths to local processed data
     data_dir = os.path.join(os.path.dirname(__file__), '..', 'graphguard', 'data', 'processed')
@@ -106,10 +123,10 @@ def train_gan():
     # Models
     generator = TemporalGenerator(feat_dim=165).to(device)
     discriminator = GraphGuardDiscriminator(feat_dim=165).to(device)
-    edge_predictor = EdgePredictor(feat_dim=165).to(device) # Fix Issue 4: Integrate EdgePredictor
+    edge_predictor = EdgePredictor(feat_dim=165, k=args.top_k).to(device) # Calibrated top-K degree (K=2)
     
-    opt_G = optim.Adam(list(generator.parameters()) + list(edge_predictor.parameters()), lr=1e-4)
-    opt_D = optim.Adam(discriminator.parameters(), lr=1e-4)
+    opt_G = optim.Adam(list(generator.parameters()) + list(edge_predictor.parameters()), lr=args.lr)
+    opt_D = optim.Adam(discriminator.parameters(), lr=args.lr)
     
     criterion = nn.BCEWithLogitsLoss()
     
@@ -117,8 +134,8 @@ def train_gan():
     illicit_train_mask = (labels == 1) & train_mask
     illicit_idx = torch.nonzero(illicit_train_mask).squeeze()
     
-    epochs = 100
-    batch_size = 128
+    epochs = args.epochs
+    batch_size = args.batch_size
     
     # Determine the results directory
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -175,12 +192,12 @@ def train_gan():
             neigh_feats = aggregate_neighbourhood(features, batch_nodes, edge_index, k_hops=1)
             fake_feats = generator.sample(real_feats, neigh_feats, batch_timesteps, n_samples=1)
             
-            # Fix Issue 4: Edge Prediction for fake nodes
-            # Select candidates from train_mask nodes that are not in the future
-            cand_mask = train_mask
+            # Fix 2: Restrict candidate pool to illicit (y == 1) or unlabeled (y == -1) in train_mask
+            # Exclude confirmed licit nodes (y == 0) from being wired as direct 1-hop neighbors
+            cand_mask = train_mask & (labels != 0)
             cand_idx = torch.nonzero(cand_mask).squeeze()
             
-            # --- FIX OOM: Subsample candidates ---
+            # --- Subsample candidates if needed to prevent OOM ---
             if cand_idx.size(0) > 2000:
                 perm = torch.randperm(cand_idx.size(0))[:2000]
                 cand_idx = cand_idx[perm]
@@ -188,8 +205,21 @@ def train_gan():
             cand_feats = features[cand_idx]
             cand_ts = timesteps[cand_idx]
             
-            # We predict edges for the whole batch at once
-            temporal_mask = (cand_ts.unsqueeze(0) <= batch_timesteps.unsqueeze(1))
+            # Tight local temporal window: max(1, t_synth - 2) <= t_cand <= t_synth
+            min_ts = (batch_timesteps.unsqueeze(1) - 2).clamp(min=1)
+            temporal_mask = (cand_ts.unsqueeze(0) <= batch_timesteps.unsqueeze(1)) & (cand_ts.unsqueeze(0) >= min_ts)
+            
+            # Safe per-row fallback if local temporal window has 0 candidates
+            fallback_mask = (cand_ts.unsqueeze(0) <= batch_timesteps.unsqueeze(1))
+            no_cands = (temporal_mask.sum(dim=-1) == 0)
+            if no_cands.any():
+                temporal_mask[no_cands] = fallback_mask[no_cands]
+            
+            # Fallback if entire candidate set is in future (e.g. at t=1 with small pool)
+            still_no_cands = (temporal_mask.sum(dim=-1) == 0)
+            if still_no_cands.any():
+                temporal_mask[still_no_cands] = True
+            
             soft_weights, hard_edges = edge_predictor.forward_gumbel(
                 fake_feats, cand_feats, batch_timesteps, cand_ts, temporal_mask
             )
@@ -197,8 +227,6 @@ def train_gan():
             d_fake_node = discriminator.discriminate_node(fake_feats.detach())
             
             # Build fake subgraph using hard edges (detached for Discriminator training)
-            # For simplicity in subgraph structural eval, we just swap features of the center nodes in the real subgraph
-            # because dynamic subgraph extraction with fake edges requires complex indexing.
             features_with_fake = sub_feats_real.clone()
             features_with_fake[mapping_real] = fake_feats.detach()
             
@@ -223,8 +251,10 @@ def train_gan():
             loss_g_struct = criterion(d_fake_subgraph_g, torch.ones_like(d_fake_subgraph_g))
             loss_fm = feature_matching_loss(real_feats, fake_feats)
             loss_temporal = temporal_violation_penalty(soft_weights, batch_timesteps, cand_ts)
+            # Fix 4: Local-to-Aggregated Feature Consistency Loss
+            loss_cons = local_aggregated_consistency_loss(fake_feats, cand_feats, soft_weights)
             
-            loss_g = loss_g_node + loss_g_struct + (0.1 * loss_fm) + (1.0 * loss_temporal)
+            loss_g = loss_g_node + loss_g_struct + (args.lambda_fm * loss_fm) + (args.lambda_temp * loss_temporal) + (args.lambda_cons * loss_cons)
                      
             loss_g.backward()
             opt_G.step()

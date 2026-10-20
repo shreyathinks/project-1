@@ -15,10 +15,10 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pure-PyTorch fallback SAGEConv (mean aggregation)
+# Hybrid Mean + Max aggregation GraphSAGE convolutions
 # ─────────────────────────────────────────────────────────────────────────────
 class _ManualSAGEConv(nn.Module):
-    """Minimal mean-aggregation GraphSAGE convolution (no PyG dependency)."""
+    """Hybrid Mean + Max neighbourhood GraphSAGE convolution (pure-PyTorch)."""
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
@@ -27,35 +27,62 @@ class _ManualSAGEConv(nn.Module):
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         src, dst = edge_index  # shape [2, E]
         N = x.size(0)
-        # Aggregate neighbours (mean) for every destination node
-        agg = torch.zeros(N, x.size(1), device=x.device)
+
+        # 1. Mean aggregation
+        agg_mean = torch.zeros(N, x.size(1), device=x.device)
         count = torch.zeros(N, 1, device=x.device)
-        agg.index_add_(0, dst, x[src])
+        agg_mean.index_add_(0, dst, x[src])
         count.index_add_(0, dst, torch.ones(dst.size(0), 1, device=x.device))
-        count = count.clamp(min=1)
-        agg = agg / count
+        valid_mask = count > 0
+        agg_mean = agg_mean / count.clamp(min=1)
+
+        # 2. Max aggregation via scatter_reduce_
+        dst_exp = dst.unsqueeze(-1).expand(-1, x.size(1))
+        agg_max = torch.full((N, x.size(1)), -1e9, device=x.device)
+        agg_max.scatter_reduce_(0, dst_exp, x[src], reduce="amax", include_self=False)
+        agg_max = torch.where(valid_mask, agg_max, torch.zeros_like(agg_max))
+
+        # Hybrid combination: Mean + 0.5 * Max (detects camouflaged outliers in peeling chains)
+        agg = agg_mean + 0.5 * agg_max
+
         # Concatenate self + aggregated neighbour features
         out = torch.cat([x, agg], dim=-1)
         return self.lin(out)
 
 
+class _PyGHybridSAGEConv(nn.Module):
+    """Hybrid Mean + Max aggregation GraphSAGE convolution using PyG."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv_mean = SAGEConv(in_channels, out_channels, aggr="mean")
+        self.conv_max = SAGEConv(in_channels, out_channels, aggr="max")
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        h_mean = self.conv_mean(x, edge_index)
+        h_max = self.conv_max(x, edge_index)
+        return h_mean + 0.5 * h_max
+
+
 def _get_conv(in_channels: int, out_channels: int):
     if _HAS_PYG:
-        return SAGEConv(in_channels, out_channels)
+        return _PyGHybridSAGEConv(in_channels, out_channels)
     return _ManualSAGEConv(in_channels, out_channels)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3-layer GraphSAGE classifier
+# GraphSAGE classifier with Ego-Feature Residual Skip Connections
 # ─────────────────────────────────────────────────────────────────────────────
 class GraphSAGEClassifier(nn.Module):
     """
-    Two-layer GraphSAGE for node classification.
+    Two-layer GraphSAGE with Ego-Feature Residual Skip Connection.
+    Concatenates raw node features x_v, Layer 1 embedding h1, and Layer 2
+    embedding h2 before classification to prevent oversmoothing sharp local features.
 
     Args:
-        in_channels:  Number of input node features (166 for Elliptic).
+        in_channels:  Number of input node features (165 for Elliptic).
         hidden_channels: Hidden dimension (default 256).
-        out_channels: Number of output classes (2 for binary fraud detection).
+        out_channels: Number of output classes (1 for binary logit, 2 for softmax).
         dropout: Dropout probability applied between layers.
     """
 
@@ -63,26 +90,40 @@ class GraphSAGEClassifier(nn.Module):
         self,
         in_channels: int,
         hidden_channels: int = 256,
-        out_channels: int = 2,
+        out_channels: int = 1,
         dropout: float = 0.3,
     ):
         super().__init__()
         self.dropout = dropout
 
         self.conv1 = _get_conv(in_channels, hidden_channels)
-        self.conv2 = _get_conv(hidden_channels, out_channels)
-
         self.bn1 = nn.BatchNorm1d(hidden_channels)
 
-        # Removed third layer and dedicated linear classifier, conv2 now outputs directly to out_channels
+        self.conv2 = _get_conv(hidden_channels, hidden_channels)
+        self.bn2 = nn.BatchNorm1d(hidden_channels)
+
+        # Skip connection: raw features + h1 + h2
+        cat_dim = in_channels + hidden_channels + hidden_channels
+        self.norm = nn.LayerNorm(cat_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(cat_dim, hidden_channels // 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels // 2, out_channels),
+        )
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        h = F.leaky_relu(self.bn1(self.conv1(x, edge_index)), 0.2)
-        h = F.dropout(h, p=self.dropout, training=self.training)
-        h = self.conv2(h, edge_index)
-        
-        return h
+        h1 = F.leaky_relu(self.bn1(self.conv1(x, edge_index)), 0.2)
+        h1_drop = F.dropout(h1, p=self.dropout, training=self.training)
+
+        h2 = F.leaky_relu(self.bn2(self.conv2(h1_drop, edge_index)), 0.2)
+
+        # Concatenate raw local features x, 1st hop h1, and 2nd hop h2
+        h_cat = torch.cat([x, h1, h2], dim=-1)
+        h_norm = F.dropout(self.norm(h_cat), p=self.dropout, training=self.training)
+
+        return self.classifier(h_norm)
 
     def predict_proba(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """Return probabilities (sigmoid for binary, softmax for multi-class)."""
@@ -90,3 +131,4 @@ class GraphSAGEClassifier(nn.Module):
         if logits.shape[-1] == 1:
             return torch.sigmoid(logits)
         return F.softmax(logits, dim=-1)
+

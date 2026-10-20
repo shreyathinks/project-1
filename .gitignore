@@ -18,6 +18,11 @@ venv.bak/
 # Project Data and Results (Ignored to prevent committing large files)
 dataset/
 results/
+!results/classifier_gnn/
+!results/classifier_gnn/final_plots/
+!results/classifier_gnn/final_plots/**
+!results/classifier_gnn/final_calibrated/
+!results/classifier_gnn/final_calibrated/metrics.json
 mlruns/
 
 # IDEs and OS files

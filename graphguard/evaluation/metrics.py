@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from sklearn.metrics import (
     f1_score,
+    fbeta_score,
     recall_score,
     precision_score,
     roc_auc_score,
@@ -40,7 +41,7 @@ def compute_classification_metrics(
         verbose:      If True, prints sklearn classification report.
 
     Returns:
-        dict with keys: illicit_f1, illicit_recall, illicit_precision,
+        dict with keys: illicit_f1, illicit_f05, illicit_recall, illicit_precision,
                         auc_roc, auc_pr, macro_f1
     """
     mask = y_true != -1
@@ -49,6 +50,8 @@ def compute_classification_metrics(
     y_prob = y_prob[mask]
 
     illicit_f1      = f1_score(y_true, y_pred, pos_label=target_class, zero_division=0)
+    illicit_f2      = fbeta_score(y_true, y_pred, beta=2.0, pos_label=target_class, zero_division=0)
+    illicit_f05     = fbeta_score(y_true, y_pred, beta=0.5, pos_label=target_class, zero_division=0)
     illicit_recall  = recall_score(y_true, y_pred, pos_label=target_class, zero_division=0)
     illicit_prec    = precision_score(y_true, y_pred, pos_label=target_class, zero_division=0)
     macro_f1        = f1_score(y_true, y_pred, average="macro", zero_division=0)
@@ -66,12 +69,148 @@ def compute_classification_metrics(
 
     return {
         "illicit_f1":        illicit_f1,
+        "illicit_f2":        illicit_f2,
+        "illicit_f05":       illicit_f05,
         "illicit_recall":    illicit_recall,
         "illicit_precision": illicit_prec,
         "auc_roc":           auc_roc,
         "auc_pr":            auc_pr,
         "macro_f1":          macro_f1,
     }
+
+
+def optimize_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    metric: str = "f1",
+    beta: float = 1.0,
+    num_thresholds: int = 100,
+) -> tuple[float, float]:
+    """
+    Tune the decision threshold strictly on validation probabilities.
+    metric: 'f1' (Balanced, default), 'f2' (Recall priority),
+            'f0.5' (Precision priority), 'precision', or 'recall'.
+    Returns: (best_threshold, best_score)
+    """
+    mask = y_true != -1
+    y_true = y_true[mask]
+    y_prob = y_prob[mask]
+
+    thresholds = np.linspace(0.01, 0.99, num_thresholds)
+    best_score = -1.0
+    best_thresh = 0.5
+
+    for t in thresholds:
+        preds = (y_prob >= t).astype(int)
+        if metric in ("f0.5", "f2"):
+            b = 0.5 if metric == "f0.5" else 2.0
+            score = fbeta_score(y_true, preds, beta=b, pos_label=1, zero_division=0)
+        elif metric == "precision":
+            score = precision_score(y_true, preds, pos_label=1, zero_division=0)
+        elif metric == "recall":
+            score = recall_score(y_true, preds, pos_label=1, zero_division=0)
+        else:
+            score = f1_score(y_true, preds, pos_label=1, zero_division=0)
+
+        if score > best_score:
+            best_score = score
+            best_thresh = t
+
+    return float(best_thresh), float(best_score)
+
+
+def find_all_operating_thresholds(y_val: np.ndarray, val_probs: np.ndarray, min_recall: float = 0.65) -> dict:
+    """
+    Calibrate four strategic operating thresholds strictly on validation data:
+      1. 'f1': Balanced Operating Point (Validation Max F1)
+      2. 'f2': AML Recall-Priority Point (Validation Max F2, beta=2.0)
+      3. 'constrained': Sweet-Spot Point (Validation Max F1 subject to Val Recall >= 0.65)
+      4. 'f0.5': Ultra-High Precision Point (Validation Max F0.5, beta=0.5)
+    """
+    mask = y_val != -1
+    y_val = y_val[mask]
+    val_probs = val_probs[mask]
+
+    thresholds = np.linspace(0.01, 0.99, 100)
+    best_f1, t_f1 = -1.0, 0.5
+    best_f2, t_f2 = -1.0, 0.5
+    best_f05, t_f05 = -1.0, 0.5
+    best_const_f1, t_const = -1.0, 0.5
+    max_rec_found, t_max_rec = -1.0, 0.5
+
+    for t in thresholds:
+        preds = (val_probs >= t).astype(int)
+        p = precision_score(y_val, preds, pos_label=1, zero_division=0)
+        r = recall_score(y_val, preds, pos_label=1, zero_division=0)
+        f1 = (2 * p * r) / (p + r + 1e-8)
+        f2 = (5 * p * r) / (4 * p + r + 1e-8)
+        f05 = (1.25 * p * r) / (0.25 * p + r + 1e-8)
+
+        if f1 > best_f1:
+            best_f1, t_f1 = f1, t
+        if f2 > best_f2:
+            best_f2, t_f2 = f2, t
+        if f05 > best_f05:
+            best_f05, t_f05 = f05, t
+        if r >= min_recall and f1 > best_const_f1:
+            best_const_f1, t_const = f1, t
+        if r > max_rec_found:
+            max_rec_found, t_max_rec = r, t
+
+    if best_const_f1 < 0:
+        t_const = t_max_rec  # fallback to threshold that gave highest recall
+
+    return {
+        "f1": float(t_f1),
+        "f2": float(t_f2),
+        "constrained": float(t_const),
+        "f0.5": float(t_f05),
+    }
+
+
+def evaluate_operating_point(y_test: np.ndarray, test_probs: np.ndarray, threshold: float) -> dict:
+    """
+    Evaluate binary classification predictions on test set given a specific decision threshold.
+    Returns full confusion matrix (TP, FP, FN, TN), rates, and metrics.
+    """
+    mask = y_test != -1
+    y_true = y_test[mask]
+    probs = test_probs[mask]
+    preds = (probs >= threshold).astype(int)
+
+    tp = int(((preds == 1) & (y_true == 1)).sum())
+    fp = int(((preds == 1) & (y_true == 0)).sum())
+    fn = int(((preds == 0) & (y_true == 1)).sum())
+    tn = int(((preds == 0) & (y_true == 0)).sum())
+
+    p = precision_score(y_true, preds, pos_label=1, zero_division=0)
+    r = recall_score(y_true, preds, pos_label=1, zero_division=0)
+    f1 = (2 * p * r) / (p + r + 1e-8)
+    f2 = (5 * p * r) / (4 * p + r + 1e-8)
+    f05 = (1.25 * p * r) / (0.25 * p + r + 1e-8)
+
+    try:
+        roc_auc = roc_auc_score(y_true, probs)
+        pr_auc = average_precision_score(y_true, probs)
+    except ValueError:
+        roc_auc = float("nan")
+        pr_auc = float("nan")
+
+    return {
+        "threshold": float(threshold),
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "precision": float(p),
+        "recall": float(r),
+        "f1": float(f1),
+        "f2": float(f2),
+        "f05": float(f05),
+        "roc_auc": float(roc_auc),
+        "pr_auc": float(pr_auc),
+    }
+
 
 
 def evaluate_model(
